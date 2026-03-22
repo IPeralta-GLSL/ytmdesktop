@@ -23,6 +23,7 @@ import log from "electron-log";
 import path from "path";
 import fs from "fs/promises";
 import electronSquirrelStartup from "electron-squirrel-startup";
+import { ElectronBlocker } from "@ghostery/adblocker-electron";
 
 import MemoryStore from "./memory-store";
 import playerStateStore, { PlayerState, VideoState } from "./player-state-store";
@@ -175,6 +176,7 @@ let settingsWindow: BrowserWindow = null;
 let ytmView: BrowserView = null;
 let tray: Tray = null;
 let trayContextMenu = null;
+let adBlockerInitialized = false;
 
 // These variables tend to be changed often so we store it in memory and write on close (less disk usage)
 let lastUrl = "";
@@ -364,6 +366,7 @@ const store = new Conf<StoreSchema>({
       ratioVolume: false
     },
     integrations: {
+      adBlockerEnabled: true,
       companionServerEnabled: false,
       companionServerAuthTokens: null,
       companionServerCORSWildcardEnabled: false,
@@ -1033,6 +1036,34 @@ const createYTMView = (): void => {
   companionServer.provide(store, memoryStore, ytmView);
   customCss.provide(store, ytmView);
   ratioVolume.provide(ytmView);
+
+  if (store.get("integrations").adBlockerEnabled && !adBlockerInitialized) {
+    adBlockerInitialized = true;
+    const cacheFile = path.join(app.getPath("userData"), "adblocker-cache.bin");
+    const partition = app.isPackaged ? "persist:ytmview" : "persist:ytmview-dev";
+    ElectronBlocker.fromPrebuiltAdsAndTracking(fetch, {
+      path: cacheFile,
+      read: async (filePath: string) => {
+        try {
+          const data = await fs.readFile(filePath);
+          return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+        } catch {
+          return new Uint8Array(0);
+        }
+      },
+      write: async (filePath: string, buffer: Uint8Array) => {
+        await fs.writeFile(filePath, buffer);
+      }
+    })
+      .then(blocker => {
+        blocker.enableBlockingInSession(session.fromPartition(partition));
+        log.info("AdBlocker initialized successfully");
+      })
+      .catch(err => {
+        adBlockerInitialized = false;
+        log.error("AdBlocker initialization failed:", err);
+      });
+  }
 
   // Attach events to ytm view
   ytmView.webContents.on("will-navigate", event => {
