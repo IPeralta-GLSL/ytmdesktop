@@ -566,4 +566,54 @@
   });
 
   ytmdControlButtons.libraryButton = libraryButton;
+
+  let audioOnlyButton = document.createElement("yt-button-shape");
+  audioOnlyButton.classList.add("ytmd-player-bar-control");
+  audioOnlyButton.classList.add("audio-only-button");
+  let audioOnlyButtonData = {
+    focused: false,
+    iconPosition: "icon-only",
+    onTap: function () {
+      window.ytmd.toggleAudioOnly();
+    }.bind(audioOnlyButton),
+    style: "mono",
+    toggled: false,
+    toggleable: true,
+    type: "text"
+  };
+  audioOnlyButton.rawProps = {
+    iconName: "yt-sys-icons:music_note",
+    data: audioOnlyButtonData
+  };
+  document
+    .querySelector("ytmusic-app-layout>ytmusic-player-bar")
+    .querySelector("ytmusic-like-button-renderer")
+    .insertAdjacentElement("afterend", audioOnlyButton);
+
+  ytmdControlButtons.audioOnlyButton = audioOnlyButton;
+
+  let downloadButton = document.createElement("yt-button-shape");
+  downloadButton.classList.add("ytmd-player-bar-control");
+  downloadButton.classList.add("download-button");
+  let downloadButtonData = {
+    focused: false,
+    iconPosition: "icon-only",
+    onTap: function () {
+      window.ytmd.downloadCurrent();
+    }.bind(downloadButton),
+    style: "mono",
+    toggled: false,
+    toggleable: false,
+    type: "text"
+  };
+  downloadButton.rawProps = {
+    iconName: "yt-sys-icons:download",
+    data: downloadButtonData
+  };
+  document
+    .querySelector("ytmusic-app-layout>ytmusic-player-bar")
+    .querySelector("ytmusic-like-button-renderer")
+    .insertAdjacentElement("afterend", downloadButton);
+
+  ytmdControlButtons.downloadButton = downloadButton;
 });

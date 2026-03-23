@@ -28,7 +28,12 @@ contextBridge.exposeInMainWorld("ytmd", {
   sendStoreUpdate: (queueState: unknown, likeStatus: string, volume: number, muted: boolean, adPlaying: boolean) =>
     ipcRenderer.send("ytmView:storeStateChanged", queueState, likeStatus, volume, muted, adPlaying),
   sendCreatePlaylistObservation: (playlist: unknown) => ipcRenderer.send("ytmView:createPlaylistObserved", playlist),
-  sendDeletePlaylistObservation: (playlistId: string) => ipcRenderer.send("ytmView:deletePlaylistObserved", playlistId)
+  sendDeletePlaylistObservation: (playlistId: string) => ipcRenderer.send("ytmView:deletePlaylistObserved", playlistId),
+  toggleAudioOnly: () => ipcRenderer.send("ytmView:audioOnlyToggle"),
+  onAudioOnlyChanged: (callback: (enabled: boolean) => void) => {
+    ipcRenderer.on("ytmView:audioOnlyChanged", (_event, enabled) => callback(enabled));
+  },
+  downloadCurrent: () => ipcRenderer.send("ytmView:downloadCurrent")
 });
 
 function createStyleSheet() {
@@ -81,6 +86,18 @@ function createStyleSheet() {
 
       .ytmd-player-bar-control.sleep-timer-button.active {
         color: #FFFFFF;
+      }
+
+      .ytmd-player-bar-control.audio-only-button {
+        margin-left: 8px;
+      }
+
+      .ytmd-player-bar-control.audio-only-button.active yt-icon {
+        color: #FFFFFF;
+      }
+
+      .ytmd-player-bar-control.download-button {
+        margin-left: 8px;
       }
     `)
   );
@@ -274,6 +291,34 @@ window.addEventListener("load", async () => {
   createNavigationMenuArrows();
   createKeyboardNavigation();
   await createAdditionalPlayerBarControls();
+
+  // Sync audio-only button state from main process
+  ipcRenderer.on("ytmView:audioOnlyChanged", async (_event, enabled: boolean) => {
+    await webFrame.executeJavaScript(`
+      (function() {
+        const btn = document.querySelector(".ytmd-player-bar-control.audio-only-button");
+        if (btn) {
+          if (${enabled ? "true" : "false"}) {
+            btn.classList.add("active");
+          } else {
+            btn.classList.remove("active");
+          }
+        }
+      })()
+    `);
+  });
+
+  // Also handle the dynamic enabled value by sending the current state at startup
+  const initPlayback = await store.get("playback");
+  if (initPlayback.audioOnly) {
+    await webFrame.executeJavaScript(`
+      (function() {
+        const btn = document.querySelector(".ytmd-player-bar-control.audio-only-button");
+        if (btn) btn.classList.add("active");
+      })()
+    `);
+  }
+
   await hideChromecastButton();
   await hookPlayerApiEvents();
   overrideHistoryButtonDisplay();

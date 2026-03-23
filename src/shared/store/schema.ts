@@ -23,6 +23,7 @@ export type StoreSchema = {
     trayIconStyle: TrayIconStyle;
   };
   playback: {
+    audioOnly: boolean;
     continueWhereYouLeftOff: boolean;
     continueWhereYouLeftOffPaused: boolean;
     enableSpeakerFill: boolean;
@@ -31,6 +32,7 @@ export type StoreSchema = {
   };
   integrations: {
     adBlockerEnabled: boolean;
+    downloadEnabled: boolean;
     companionServerEnabled: boolean;
     companionServerAuthTokens: string | null; // array[object] | Encrypted for security
     companionServerCORSWildcardEnabled: boolean;

@@ -52,6 +52,7 @@ const continueWhereYouLeftOff = ref<boolean>(playback.continueWhereYouLeftOff);
 const continueWhereYouLeftOffPaused = ref<boolean>(playback.continueWhereYouLeftOffPaused);
 const enableSpeakerFill = ref<boolean>(playback.enableSpeakerFill);
 const progressInTaskbar = ref<boolean>(playback.progressInTaskbar);
+const audioOnly = ref<boolean>(playback.audioOnly);
 const ratioVolume = ref<boolean>(playback.ratioVolume);
 
 const companionServerEnabled = ref<boolean>(integrations.companionServerEnabled);
@@ -62,6 +63,7 @@ const companionServerCORSWildcardEnabled = ref<boolean>(integrations.companionSe
 const discordPresenceEnabled = ref<boolean>(integrations.discordPresenceEnabled);
 const lastFMEnabled = ref<boolean>(integrations.lastFMEnabled);
 const adBlockerEnabled = ref<boolean>(integrations.adBlockerEnabled);
+const downloadEnabled = ref<boolean>(integrations.downloadEnabled ?? false);
 
 const shortcutPlayPause = ref<string>(shortcuts.playPause);
 const shortcutNext = ref<string>(shortcuts.next);
@@ -91,6 +93,7 @@ store.onDidAnyChange(async newState => {
   continueWhereYouLeftOffPaused.value = newState.playback.continueWhereYouLeftOffPaused;
   enableSpeakerFill.value = newState.playback.enableSpeakerFill;
   progressInTaskbar.value = newState.playback.progressInTaskbar;
+  audioOnly.value = newState.playback.audioOnly;
   ratioVolume.value = newState.playback.ratioVolume;
 
   companionServerEnabled.value = newState.integrations.companionServerEnabled;
@@ -101,6 +104,7 @@ store.onDidAnyChange(async newState => {
   discordPresenceEnabled.value = newState.integrations.discordPresenceEnabled;
   lastFMEnabled.value = newState.integrations.lastFMEnabled;
   adBlockerEnabled.value = newState.integrations.adBlockerEnabled;
+  downloadEnabled.value = newState.integrations.downloadEnabled ?? false;
   lastFMSessionKey.value = newState.lastfm.sessionKey;
   scrobblePercent.value = newState.lastfm.scrobblePercent;
 
@@ -165,6 +169,7 @@ async function settingsChanged() {
   store.set("playback.continueWhereYouLeftOffPaused", continueWhereYouLeftOffPaused.value);
   store.set("playback.progressInTaskbar", progressInTaskbar.value);
   store.set("playback.enableSpeakerFill", enableSpeakerFill.value);
+  store.set("playback.audioOnly", audioOnly.value);
   store.set("playback.ratioVolume", ratioVolume.value);
 
   store.set("integrations.companionServerEnabled", companionServerEnabled.value);
@@ -172,6 +177,7 @@ async function settingsChanged() {
   store.set("integrations.discordPresenceEnabled", discordPresenceEnabled.value);
   store.set("integrations.lastFMEnabled", lastFMEnabled.value);
   store.set("integrations.adBlockerEnabled", adBlockerEnabled.value);
+  store.set("integrations.downloadEnabled", downloadEnabled.value);
   store.set("lastfm.scrobblePercent", scrobblePercent.value);
 
   store.set("shortcuts.playPause", shortcutPlayPause.value);
@@ -410,6 +416,20 @@ window.ytmd.handleUpdateDownloaded(() => {
             type="checkbox"
             name="Ad Blocker"
             description="Block ads and trackers in YouTube Music"
+            @change="settingsChanged"
+          />
+          <YTMDSetting
+            v-model="audioOnly"
+            type="checkbox"
+            name="Audio only (no video)"
+            description="Block video streams and play audio only. Reduces bandwidth and CPU usage."
+            @change="settingsChanged"
+          />
+          <YTMDSetting
+            v-model="downloadEnabled"
+            type="checkbox"
+            name="Download songs"
+            description="Show a download button in the player. Requires yt-dlp installed (sudo pacman -S yt-dlp)."
             @change="settingsChanged"
           />
           <YTMDSetting v-model="discordPresenceEnabled" type="checkbox" name="Discord rich presence" @change="settingsChanged" />

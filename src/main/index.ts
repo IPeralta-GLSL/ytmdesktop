@@ -22,8 +22,10 @@ import Conf from "conf";
 import log from "electron-log";
 import path from "path";
 import fs from "fs/promises";
+import { createWriteStream } from "fs";
+import https from "https";
+import { spawn } from "child_process";
 import electronSquirrelStartup from "electron-squirrel-startup";
-import { ElectronBlocker } from "@ghostery/adblocker-electron";
 
 import MemoryStore from "./memory-store";
 import playerStateStore, { PlayerState, VideoState } from "./player-state-store";
@@ -176,7 +178,205 @@ let settingsWindow: BrowserWindow = null;
 let ytmView: BrowserView = null;
 let tray: Tray = null;
 let trayContextMenu = null;
-let adBlockerInitialized = false;
+
+const AUDIO_ONLY_CSS = `
+  video,
+  video.html5-main-video,
+  video.video-stream,
+  ytmusic-player video,
+  ytmusic-player-bar video,
+  ytmusic-player .html5-video-container,
+  .ytmusic-player-page video,
+  #player-container video,
+  ytmusic-player-page video {
+    opacity: 0 !important;
+    pointer-events: none !important;
+    position: absolute !important;
+    width: 1px !important;
+    height: 1px !important;
+  }
+  .ytmusic-player-bar .thumbnail-image-wrapper,
+  ytmusic-player .thumbnail-image-wrapper,
+  ytmusic-player-page .thumbnail-image-wrapper { display: block !important; }
+`;
+
+// JS content-script equivalent: MutationObserver that hides video elements as they are created
+// NOTE: never pause — only hide visually. Pausing stops audio too.
+const AUDIO_ONLY_HIDE_JS = `(function() {
+  function _ytmdHideVideos() {
+    document.querySelectorAll('video').forEach(function(v) {
+      v.style.setProperty('opacity', '0', 'important');
+      v.style.setProperty('pointer-events', 'none', 'important');
+      v.style.setProperty('position', 'absolute', 'important');
+      v.style.setProperty('width', '1px', 'important');
+      v.style.setProperty('height', '1px', 'important');
+    });
+  }
+  _ytmdHideVideos();
+  if (window.__ytmdAudioObserver) window.__ytmdAudioObserver.disconnect();
+  window.__ytmdAudioObserver = new MutationObserver(_ytmdHideVideos);
+  window.__ytmdAudioObserver.observe(document.documentElement, { childList: true, subtree: true });
+})()`;
+
+const AUDIO_ONLY_SHOW_JS = `(function() {
+  if (window.__ytmdAudioObserver) {
+    window.__ytmdAudioObserver.disconnect();
+    window.__ytmdAudioObserver = null;
+  }
+  document.querySelectorAll('video').forEach(function(v) {
+    v.style.removeProperty('opacity');
+    v.style.removeProperty('pointer-events');
+    v.style.removeProperty('position');
+    v.style.removeProperty('width');
+    v.style.removeProperty('height');
+  });
+})()`;
+
+let audioOnlyCssKey: string | null = null;
+
+const getYtmPartition = () => (app.isPackaged ? "persist:ytmview" : "persist:ytmview-dev");
+
+// Downloads a file via HTTPS following redirects
+function downloadHttpsFile(url: string, dest: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const file = createWriteStream(dest);
+    function get(u: string) {
+      https
+        .get(u, { headers: { "User-Agent": "ytmdesktop-app" } }, res => {
+          if (res.statusCode === 301 || res.statusCode === 302 || res.statusCode === 303) {
+            return get(res.headers.location!);
+          }
+          if (res.statusCode !== 200) {
+            return reject(new Error(`HTTP ${res.statusCode} for ${u}`));
+          }
+          res.pipe(file);
+          file.on("finish", () => file.close(() => resolve()));
+          file.on("error", reject);
+        })
+        .on("error", reject);
+    }
+    get(url);
+  });
+}
+
+// Downloads and loads uBlock Origin as a Chromium extension in the ytmview session
+async function setupUBlockOrigin(): Promise<void> {
+  const UBLOCK_VERSION = "1.70.0";
+  const UBLOCK_URL = `https://github.com/gorhill/uBlock/releases/download/${UBLOCK_VERSION}/uBlock0_${UBLOCK_VERSION}.chromium.zip`;
+
+  const extBaseDir = path.join(app.getPath("userData"), "extensions");
+  // Container dir for the zip extraction
+  const uBlockContainerDir = path.join(extBaseDir, `ublock-origin-${UBLOCK_VERSION}`);
+  // The zip extracts into a uBlock0.chromium/ subdirectory — that's the actual extension dir
+  const uBlockExtDir = path.join(uBlockContainerDir, "uBlock0.chromium");
+  const manifestPath = path.join(uBlockExtDir, "manifest.json");
+
+  try {
+    await fs.mkdir(extBaseDir, { recursive: true });
+
+    let needsDownload = false;
+    try {
+      await fs.access(manifestPath);
+    } catch {
+      needsDownload = true;
+    }
+
+    if (needsDownload) {
+      log.info(`Downloading uBlock Origin ${UBLOCK_VERSION}...`);
+      const zipPath = path.join(extBaseDir, `ublock-origin-${UBLOCK_VERSION}.zip`);
+      await downloadHttpsFile(UBLOCK_URL, zipPath);
+
+      await fs.mkdir(uBlockContainerDir, { recursive: true });
+      await new Promise<void>((resolve, reject) => {
+        const proc = spawn("unzip", ["-o", zipPath, "-d", uBlockContainerDir]);
+        proc.on("close", code => (code === 0 ? resolve() : reject(new Error(`unzip failed: ${code}`))));
+        proc.on("error", reject);
+      });
+      await fs.unlink(zipPath).catch(() => {});
+      log.info(`uBlock Origin ${UBLOCK_VERSION} downloaded and extracted successfully`);
+    }
+
+    const sess = session.fromPartition(getYtmPartition());
+    await sess.loadExtension(uBlockExtDir, { allowFileAccess: true });
+    log.info(`uBlock Origin ${UBLOCK_VERSION} loaded into ytmview session from ${uBlockExtDir}`);
+  } catch (err) {
+    log.error("Failed to setup uBlock Origin:", err);
+  }
+}
+
+function updateSessionWebRequest() {
+  const sess = session.fromPartition(getYtmPartition());
+  const audioOnlyEnabled = store.get("playback").audioOnly;
+  const adBlockerEnabled = store.get("integrations").adBlockerEnabled;
+
+  sess.webRequest.onBeforeRequest(null);
+
+  if (!audioOnlyEnabled && !adBlockerEnabled) return;
+
+  // Build URL pattern list
+  const urlPatterns: string[] = ["*://*.googlevideo.com/*"];
+  if (adBlockerEnabled) {
+    // Block known ad-serving domains as a fallback if uBlock isn't filtering them
+    urlPatterns.push(
+      "*://pagead2.googlesyndication.com/*",
+      "*://googleads.g.doubleclick.net/*",
+      "*://ad.doubleclick.net/*",
+      "*://static.doubleclick.net/*",
+      "*://www.googleadservices.com/*",
+      "*://pubads.g.doubleclick.net/*"
+    );
+  }
+
+  sess.webRequest.onBeforeRequest({ urls: urlPatterns }, (details, callback) => {
+    const url = details.url;
+
+    if (url.includes("googlevideo.com")) {
+      // In audio-only mode, block all video/* streams
+      if (audioOnlyEnabled) {
+        try {
+          const decoded = decodeURIComponent(url);
+          if (decoded.includes("mime=video/")) return callback({ cancel: true });
+        } catch {
+          /* ignore */
+        }
+        return callback({ cancel: false });
+      }
+      // With adblock only, block streams identified as ad video (dclk_video_ads)
+      if (adBlockerEnabled) {
+        try {
+          const decoded = decodeURIComponent(url);
+          if (decoded.includes("source=dclk_video_ads") || decoded.includes("&ctier=A") || decoded.includes("adsid=")) {
+            return callback({ cancel: true });
+          }
+        } catch {
+          /* ignore */
+        }
+        return callback({ cancel: false });
+      }
+      return callback({ cancel: false });
+    }
+
+    // Block all ad-serving domain requests
+    callback({ cancel: true });
+  });
+}
+
+const applyAudioOnly = async (enabled: boolean) => {
+  if (!ytmView) return;
+  if (enabled) {
+    if (!audioOnlyCssKey) {
+      audioOnlyCssKey = await ytmView.webContents.insertCSS(AUDIO_ONLY_CSS);
+    }
+    await ytmView.webContents.executeJavaScript(AUDIO_ONLY_HIDE_JS);
+  } else {
+    if (audioOnlyCssKey) {
+      await ytmView.webContents.removeInsertedCSS(audioOnlyCssKey);
+      audioOnlyCssKey = null;
+    }
+    await ytmView.webContents.executeJavaScript(AUDIO_ONLY_SHOW_JS);
+  }
+  updateSessionWebRequest();
+};
 
 // These variables tend to be changed often so we store it in memory and write on close (less disk usage)
 let lastUrl = "";
@@ -359,6 +559,7 @@ const store = new Conf<StoreSchema>({
       trayIconStyle: TrayIconStyle.Auto
     },
     playback: {
+      audioOnly: true,
       continueWhereYouLeftOff: true,
       continueWhereYouLeftOffPaused: true,
       enableSpeakerFill: false,
@@ -367,6 +568,7 @@ const store = new Conf<StoreSchema>({
     },
     integrations: {
       adBlockerEnabled: true,
+      downloadEnabled: false,
       companionServerEnabled: false,
       companionServerAuthTokens: null,
       companionServerCORSWildcardEnabled: false,
@@ -671,6 +873,10 @@ function setupTaskbarFeatures() {
   store.onDidChange("playback", (newValue, oldValue) => {
     if (mainWindow && newValue.progressInTaskbar !== oldValue.progressInTaskbar && !newValue.progressInTaskbar) {
       mainWindow.setProgressBar(-1);
+    }
+    if (ytmView && newValue.audioOnly !== oldValue.audioOnly) {
+      applyAudioOnly(newValue.audioOnly);
+      ytmView.webContents.send("ytmView:audioOnlyChanged", newValue.audioOnly);
     }
   });
 }
@@ -1037,32 +1243,9 @@ const createYTMView = (): void => {
   customCss.provide(store, ytmView);
   ratioVolume.provide(ytmView);
 
-  if (store.get("integrations").adBlockerEnabled && !adBlockerInitialized) {
-    adBlockerInitialized = true;
-    const cacheFile = path.join(app.getPath("userData"), "adblocker-cache.bin");
-    const partition = app.isPackaged ? "persist:ytmview" : "persist:ytmview-dev";
-    ElectronBlocker.fromPrebuiltAdsAndTracking(fetch, {
-      path: cacheFile,
-      read: async (filePath: string) => {
-        try {
-          const data = await fs.readFile(filePath);
-          return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-        } catch {
-          return new Uint8Array(0);
-        }
-      },
-      write: async (filePath: string, buffer: Uint8Array) => {
-        await fs.writeFile(filePath, buffer);
-      }
-    })
-      .then(blocker => {
-        blocker.enableBlockingInSession(session.fromPartition(partition));
-        log.info("AdBlocker initialized successfully");
-      })
-      .catch(err => {
-        adBlockerInitialized = false;
-        log.error("AdBlocker initialization failed:", err);
-      });
+  // Set up network-level request filtering (ad domain blocking + audio-only video blocking)
+  if (store.get("integrations").adBlockerEnabled || store.get("playback").audioOnly) {
+    updateSessionWebRequest();
   }
 
   // Attach events to ytm view
@@ -1186,12 +1369,128 @@ const createYTMView = (): void => {
 
   // Loading status event handlers
   ytmView.webContents.on("did-start-loading", () => {
+    audioOnlyCssKey = null;
     memoryStore.set("ytmViewLoadingStatus", "Loading YouTube Music...");
+  });
+
+  // Inject fetch interceptor on dom-ready (early, before YTM makes its first API calls)
+  ytmView.webContents.on("dom-ready", () => {
+    if (store.get("integrations").adBlockerEnabled) {
+      ytmView.webContents
+        .executeJavaScript(
+          `
+        (function() {
+          if (window.__ytmdAdStripperActive) return;
+          window.__ytmdAdStripperActive = true;
+          var _origFetch = window.fetch;
+          window.fetch = function() {
+            var args = arguments;
+            return _origFetch.apply(this, args).then(function(response) {
+              var url = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url) || '';
+              if (url.indexOf('/youtubei/v1/') !== -1) {
+                return response.clone().json().then(function(json) {
+                  delete json.adPlacements;
+                  delete json.adSlots;
+                  delete json.playerAds;
+                  if (json.playerConfig) delete json.playerConfig.adConfig;
+                  return new Response(JSON.stringify(json), {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  });
+                }).catch(function() { return response; });
+              }
+              return response;
+            });
+          };
+        })();
+      `
+        )
+        .catch(() => {});
+    }
   });
 
   ytmView.webContents.on("did-stop-loading", () => {
     if (!memoryStore.get("ytmViewLoadingError")) {
       memoryStore.set("ytmViewLoadingStatus", "Loaded YouTube Music");
+      applyAudioOnly(store.get("playback.audioOnly"));
+
+      // Unregister YTM service worker so its fetch events go through session.webRequest
+      if (store.get("integrations").adBlockerEnabled || store.get("playback").audioOnly) {
+        ytmView.webContents
+          .executeJavaScript(
+            `
+          navigator.serviceWorker.getRegistrations().then(function(regs) {
+            regs.forEach(function(r) { r.unregister(); });
+          }).catch(function(){});
+        `
+          )
+          .catch(() => {});
+      }
+
+      // Intercept fetch to strip adPlacements from player API responses
+      if (store.get("integrations").adBlockerEnabled) {
+        ytmView.webContents
+          .executeJavaScript(
+            `
+          (function() {
+            if (window.__ytmdAdStripperActive) return;
+            window.__ytmdAdStripperActive = true;
+            var _origFetch = window.fetch;
+            window.fetch = function() {
+              var args = arguments;
+              return _origFetch.apply(this, args).then(function(response) {
+                var url = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url) || '';
+                if (url.indexOf('/youtubei/v1/player') !== -1) {
+                  return response.clone().json().then(function(json) {
+                    delete json.adPlacements;
+                    delete json.adSlots;
+                    delete json.playerAds;
+                    if (json.playerConfig) delete json.playerConfig.adConfig;
+                    return new Response(JSON.stringify(json), {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers
+                    });
+                  }).catch(function() { return response; });
+                }
+                return response;
+              });
+            };
+            var _beacon = navigator.sendBeacon.bind(navigator);
+            navigator.sendBeacon = function(url) {
+              if (url && url.indexOf('/api/stats/ads') !== -1) return true;
+              return _beacon.apply(navigator, arguments);
+            };
+            var _adObserver = new MutationObserver(function() {
+              // Try skip button first
+              var skip = document.querySelector('.ytp-ad-skip-button-modern, .ytp-skip-ad-button, .ytp-ad-skip-button');
+              if (skip) { skip.click(); return; }
+              // Detect ad via player bar attribute or ad overlay
+              var adBadge = document.querySelector('ytmusic-player-bar[is-ad-playing], ytmusic-player[ad-playing]');
+              var adOverlay = document.querySelector('.ytp-ad-player-overlay, .ytp-ad-overlay-container');
+              if (adBadge || adOverlay) {
+                var vid = document.querySelector('video');
+                if (vid) {
+                  // Try seek to end; if content is not seekable, speed up to get through fast
+                  var dur = vid.duration;
+                  if (dur && isFinite(dur) && dur > 0) {
+                    try { vid.currentTime = dur - 0.1; } catch(e) {}
+                  }
+                  if (vid.playbackRate < 16) vid.playbackRate = 16;
+                }
+              } else {
+                // Not in ad — restore normal playback rate
+                var vid2 = document.querySelector('video');
+                if (vid2 && vid2.playbackRate > 2) vid2.playbackRate = 1;
+              }
+            });
+            _adObserver.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['is-ad-playing', 'ad-playing'] });
+          })();
+        `
+          )
+          .catch(() => {});
+      }
     }
   });
 
@@ -1705,6 +2004,35 @@ app.on("ready", async () => {
     }
   });
 
+  ipcMain.on("ytmView:audioOnlyToggle", event => {
+    if (event.sender !== ytmView?.webContents) return;
+    const current = store.get("playback.audioOnly") as boolean;
+    const next = !current;
+    store.set("playback.audioOnly", next);
+    ytmView?.webContents.send("ytmView:audioOnlyChanged", next);
+  });
+
+  ipcMain.on("ytmView:downloadCurrent", event => {
+    if (event.sender !== ytmView?.webContents) return;
+    if (!store.get("integrations").downloadEnabled) return;
+    if (!lastVideoId) return;
+
+    const url = `https://music.youtube.com/watch?v=${lastVideoId}`;
+    const downloadDir = app.getPath("downloads");
+    const ytdlpProcess = spawn("yt-dlp", ["-x", "--audio-format", "mp3", "-o", `${downloadDir}/%(title)s.%(ext)s`, url]);
+    ytdlpProcess.on("error", err => {
+      log.error("yt-dlp download error:", err.message);
+      dialog.showErrorBox(
+        "Download failed",
+        `yt-dlp is not installed or not found in PATH.\n\nInstall it with: sudo pacman -S yt-dlp\n\nError: ${err.message}`
+      );
+    });
+    ytdlpProcess.on("close", code => {
+      log.info(`yt-dlp exited with code ${code}`);
+      if (code === 0) shell.openPath(downloadDir);
+    });
+  });
+
   ipcMain.handle("ytmView:getIntegrationScripts", event => {
     if (event.sender !== ytmView.webContents) return;
 
@@ -1926,6 +2254,11 @@ app.on("ready", async () => {
     map[obj.name] = obj.script;
     return map;
   }, {});
+
+  // Load uBlock Origin BEFORE creating the YTM view so the extension is ready when the page loads
+  if (store.get("integrations").adBlockerEnabled) {
+    await setupUBlockOrigin();
+  }
 
   // Create the YouTube Music view
   createYTMView();
